@@ -18,11 +18,10 @@ except ImportError as e:
     sys.exit(1)
 
 
-# Default speaker - can be made configurable later
-DEFAULT_SPEAKER_PATH = "assets/chief_voicelines_combined.wav"
+# Default language - can be made configurable later
 DEFAULT_LANGUAGE = "en-us"
 
-def generate_audio(text, output_path, speaker_path=DEFAULT_SPEAKER_PATH, language=DEFAULT_LANGUAGE):
+def generate_audio(text, output_path, speaker_path, language=DEFAULT_LANGUAGE):
     """Generates audio from text using Zonos and saves it to output_path."""
     try:
         print(f"Initializing Zonos model (transformer)...", file=sys.stderr)
@@ -33,6 +32,7 @@ def generate_audio(text, output_path, speaker_path=DEFAULT_SPEAKER_PATH, languag
 
         # Determine absolute path for speaker audio relative to this script
         script_dir = os.path.dirname(os.path.realpath(__file__))
+        # Use the provided speaker_path argument
         abs_speaker_path = os.path.join(script_dir, speaker_path)
 
         print(f"Loading speaker embedding from: {abs_speaker_path}", file=sys.stderr)
@@ -85,9 +85,9 @@ def generate_audio(text, output_path, speaker_path=DEFAULT_SPEAKER_PATH, languag
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate audio from text using Zonos TTS.")
     parser.add_argument("text_base64", type=str, help="The Base64 encoded input text to synthesize.")
-    parser.add_argument("output_path", type=str, help="The path to save the generated WAV file (relative to project root or absolute).")
+    parser.add_argument("output_path", type=str, help="The path to save the generated WAV file.")
+    parser.add_argument("--speaker_path", type=str, required=True, help="Path to the speaker reference audio file (relative to script directory).")
     # Optional arguments for future enhancement
-    # parser.add_argument("--speaker", type=str, default=DEFAULT_SPEAKER_PATH, help="Path to the speaker reference audio file.")
     # parser.add_argument("--lang", type=str, default=DEFAULT_LANGUAGE, help="Language code (e.g., en-us, ja, zh, fr, de).")
 
     args = parser.parse_args()
@@ -101,9 +101,10 @@ if __name__ == "__main__":
 
     print(f"Starting audio generation for decoded text: '{decoded_text[:100]}...'", file=sys.stderr) # Log truncated decoded text
     print(f"Requested output file path: {args.output_path}", file=sys.stderr)
+    print(f"Using speaker voice: {args.speaker_path}", file=sys.stderr) # Log speaker path
 
-    # Call the generation function with the decoded text
-    success = generate_audio(decoded_text, args.output_path)
+    # Call the generation function with the decoded text and speaker path
+    success = generate_audio(decoded_text, args.output_path, speaker_path=args.speaker_path)
 
     if success:
         print("Audio generation completed successfully.", file=sys.stderr)
