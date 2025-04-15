@@ -4,144 +4,317 @@ import os
 import sys
 import json
 import traceback
+import math
+import multiprocessing as mp
 
+# --- Zonos Imports ---
+# These might be needed globally for type hints or initial checks
 try:
     from zonos.model import Zonos
     from zonos.conditioning import make_cond_dict
-    from zonos.utils import DEFAULT_DEVICE as device
+    from zonos.utils import DEFAULT_DEVICE as default_device_name # Get the default name ('cuda:0', 'cpu')
 except ImportError as e:
     print(f"Error importing Zonos modules: {e}", file=sys.stderr)
     print("Ensure you are running this script within the activated Zonos virtual environment (.venv/Scripts/activate)", file=sys.stderr)
     sys.exit(1)
 
-# Default language - can be made configurable later via JSON input if needed
+# --- Constants ---
 DEFAULT_LANGUAGE = "en-us"
+# VRAM requirement per worker (for the main model + embedding + overhead)
+REQUIRED_VRAM_PER_WORKER_GB = 4.0
+REQUIRED_VRAM_BYTES_PER_WORKER = int(REQUIRED_VRAM_PER_WORKER_GB * (1024**3))
+MODEL_NAME = "Zyphra/Zonos-v0.1-transformer"
+SENTINEL = None # Signal for workers to terminate
 
-def load_speaker_embedding(model, speaker_path, script_dir):
-    """Loads or reuses speaker embedding."""
+# --- Utility Functions ---
+def get_available_vram():
+    """Gets available VRAM in bytes on the default CUDA device."""
+    if torch.cuda.is_available():
+        try:
+            device_index = torch.cuda.current_device()
+            free_mem, _ = torch.cuda.mem_get_info(device_index)
+            buffer = 100 * 1024 * 1024 # Slightly larger buffer for persistent workers
+            return max(0, free_mem - buffer)
+        except Exception as e:
+            print(f"Warning: Could not get VRAM info: {e}", file=sys.stderr)
+            return 0
+    return 0
+
+# --- Speaker Embedding Loader (Used by Worker) ---
+# Renamed slightly to avoid conflict if generate_single_audio is kept below
+def load_speaker_embedding_for_worker(model_instance, speaker_path, script_dir, device):
+    """Loads speaker embedding within a worker process."""
     abs_speaker_path = os.path.join(script_dir, speaker_path)
-    print(f"Loading speaker embedding from: {abs_speaker_path}", file=sys.stderr)
+    # print(f"[Worker {os.getpid()}] Attempting to load speaker: {abs_speaker_path}", file=sys.stderr) # Verbose
     if not os.path.exists(abs_speaker_path):
-        print(f"Error: Speaker audio file not found at {abs_speaker_path}", file=sys.stderr)
+        print(f"[Worker {os.getpid()}] Error: Speaker audio file not found at {abs_speaker_path}", file=sys.stderr)
         return None
-
     try:
         wav, sampling_rate = torchaudio.load(abs_speaker_path)
         wav = wav.to(device)
-        speaker = model.make_speaker_embedding(wav, sampling_rate)
-        print("Speaker embedding created.", file=sys.stderr)
+        speaker = model_instance.make_speaker_embedding(wav, sampling_rate)
+        # print(f"[Worker {os.getpid()}] Speaker embedding loaded successfully.", file=sys.stderr) # Verbose
         return speaker
     except Exception as e:
-        print(f"Error loading speaker embedding: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        print(f"[Worker {os.getpid()}] Error loading speaker embedding {speaker_path}: {e}", file=sys.stderr)
+        # traceback.print_exc(file=sys.stderr) # Can be too verbose
         return None
 
-
-def generate_single_audio(model, text, output_path, speaker_embedding, language=DEFAULT_LANGUAGE):
-    """Generates audio for a single text input using pre-loaded model and speaker."""
+# --- Single Generation Function (Used by Worker) ---
+def generate_audio_segment(model_instance, text, output_path, speaker_embedding, request_id):
+    """Generates audio for a single request using the pre-loaded model and speaker embedding."""
+    output_abs_path = os.path.abspath(output_path)
     try:
-        print(f"Preparing conditioning for text: '{text[:50]}...'", file=sys.stderr)
-        cond_dict = make_cond_dict(text=text, speaker=speaker_embedding, language=language)
-        conditioning = model.prepare_conditioning(cond_dict)
-        print("Conditioning prepared.", file=sys.stderr)
+        # print(f"[Worker {os.getpid()}] Generating audio for request '{request_id}'...", file=sys.stderr) # Verbose
+        # Re-import make_cond_dict if needed (might be safer within the function)
+        from zonos.conditioning import make_cond_dict
+        cond_dict = make_cond_dict(text=text, speaker=speaker_embedding, language=DEFAULT_LANGUAGE)
+        conditioning = model_instance.prepare_conditioning(cond_dict)
+        codes = model_instance.generate(conditioning, disable_torch_compile=True)
+        codes = codes.to(model_instance.autoencoder.dac.device)
+        wavs = model_instance.autoencoder.decode(codes).cpu()
 
-        print("Generating audio codes...", file=sys.stderr)
-        codes = model.generate(conditioning, disable_torch_compile=True) # Keep compile disabled for now
-        print("Audio codes generated.", file=sys.stderr)
-
-        print("Decoding audio...", file=sys.stderr)
-        codes = codes.to(model.autoencoder.dac.device)
-        wavs = model.autoencoder.decode(codes).cpu()
-        print("Audio decoded.", file=sys.stderr)
-
-        output_abs_path = os.path.abspath(output_path)
         output_dir = os.path.dirname(output_abs_path)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
-            print(f"Created output directory: {output_dir}", file=sys.stderr)
 
-        print(f"Saving audio to: {output_abs_path}", file=sys.stderr)
-        torchaudio.save(output_abs_path, wavs[0], model.autoencoder.sampling_rate)
-        print(f"Audio saved successfully to {output_abs_path}", file=sys.stderr)
-
-        # Print the final path to stdout for the calling process
-        print(output_abs_path, flush=True) # Ensure output is flushed immediately
-        return True
+        torchaudio.save(output_abs_path, wavs[0], model_instance.autoencoder.sampling_rate)
+        # print(f"[Worker {os.getpid()}] Audio saved to {output_abs_path} for request '{request_id}'", file=sys.stderr) # Verbose
+        return {"request_id": request_id, "output_path": output_abs_path, "success": True, "error": None}
 
     except Exception as e:
-        print(f"Error during single audio generation for text '{text[:50]}...': {e}", file=sys.stderr)
+        print(f"[Worker {os.getpid()}] Error during audio generation for request '{request_id}': {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-        return False
+        return {"request_id": request_id, "output_path": None, "success": False, "error": str(e)}
 
-if __name__ == "__main__":
-    # --- Initialization ---
-    print(f"Initializing Zonos model (transformer)...", file=sys.stderr)
+# --- Persistent Worker Process Function ---
+def persistent_worker(task_queue, result_queue, script_dir):
+    """
+    Worker process function. Loads model once, then processes tasks from queue.
+    Manages its own speaker embedding cache (currently just the last used one).
+    """
+    worker_pid = os.getpid()
+    print(f"[Worker {worker_pid}] Initializing...", file=sys.stderr)
+
+    # Determine device for this worker
+    import torch # Ensure torch is imported in the worker process
+    device = torch.device(default_device_name if torch.cuda.is_available() else "cpu")
+    print(f"[Worker {worker_pid}] Using device: {device}", file=sys.stderr)
+
+    # --- Load Model Instance ONCE ---
+    worker_model = None
     try:
-        # Ensure the model path is correct relative to this script if needed,
-        # but from_pretrained should handle it if run within the venv.
-        model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
-        print(f"Model loaded on device: {device}", file=sys.stderr)
+        # Re-import Zonos locally within the worker function's scope
+        from zonos.model import Zonos
+        print(f"[Worker {worker_pid}] Loading model '{MODEL_NAME}' on {device}...", file=sys.stderr)
+        worker_model = Zonos.from_pretrained(MODEL_NAME, device=device)
+        print(f"[Worker {worker_pid}] Model loaded.", file=sys.stderr)
     except Exception as model_load_error:
-        print(f"FATAL: Failed to load Zonos model: {model_load_error}", file=sys.stderr)
+        print(f"[Worker {worker_pid}] FATAL: Failed to load Zonos model: {model_load_error}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
+        # Cannot proceed without model, maybe put an error on result queue? Difficult.
+        # For now, just exit the worker. Main process will hang waiting for results.
+        return # Exit worker
 
-    script_dir = os.path.dirname(os.path.realpath(__file__))
+    # --- Worker State ---
     current_speaker_path = None
     current_speaker_embedding = None
-    lines_processed = 0
-    lines_succeeded = 0
 
-    print("Ready to process JSON lines from stdin...", file=sys.stderr)
+    # --- Task Processing Loop ---
+    while True:
+        try:
+            task_data = task_queue.get() # Blocking wait for a task
 
-    # --- Processing Loop ---
-    for line in sys.stdin:
-        lines_processed += 1
+            if task_data is SENTINEL:
+                print(f"[Worker {worker_pid}] Received sentinel. Exiting.", file=sys.stderr)
+                break # Exit loop and terminate worker
+
+            # Extract task details
+            text = task_data["text"]
+            output_path = task_data["output_path"]
+            required_speaker_path = task_data["speaker_path"]
+            request_id = task_data["request_id"]
+
+            # print(f"[Worker {worker_pid}] Received task: {request_id} (Speaker: {required_speaker_path})", file=sys.stderr) # Verbose
+
+            # --- Manage Speaker Embedding ---
+            if required_speaker_path != current_speaker_path:
+                print(f"[Worker {worker_pid}] Speaker change required for request '{request_id}'. Current: '{current_speaker_path}', Required: '{required_speaker_path}'.", file=sys.stderr)
+                # Clear previous embedding (optional, helps if memory is tight)
+                if current_speaker_embedding is not None:
+                    del current_speaker_embedding
+                    if torch.cuda.is_available(): torch.cuda.empty_cache() # Try to free VRAM
+                    # print(f"[Worker {worker_pid}] Cleared previous speaker embedding.", file=sys.stderr) # Verbose
+                current_speaker_embedding = load_speaker_embedding_for_worker(worker_model, required_speaker_path, script_dir, device)
+                current_speaker_path = required_speaker_path # Update even if loading failed
+
+                if current_speaker_embedding is None:
+                    print(f"[Worker {worker_pid}] Failed to load speaker '{required_speaker_path}' for request '{request_id}'.", file=sys.stderr)
+                    result_queue.put({"request_id": request_id, "output_path": None, "success": False, "error": f"Failed to load speaker embedding: {required_speaker_path}"})
+                    continue # Skip to next task
+                else:
+                     print(f"[Worker {worker_pid}] Loaded speaker '{required_speaker_path}'.", file=sys.stderr)
+
+            # --- Generate Audio ---
+            if current_speaker_embedding is not None: # Should always be true unless load failed above
+                result = generate_audio_segment(
+                    worker_model,
+                    text,
+                    output_path,
+                    current_speaker_embedding,
+                    request_id
+                )
+                result_queue.put(result)
+            # else case handled above by putting error result and continuing
+
+        except Exception as loop_error:
+            # Catch unexpected errors in the loop/queue handling
+            print(f"[Worker {worker_pid}] UNEXPECTED ERROR in processing loop: {loop_error}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            # Try to report error for the current task if possible, otherwise might lose track
+            request_id_for_error = task_data.get("request_id", "unknown") if isinstance(task_data, dict) else "unknown"
+            result_queue.put({"request_id": request_id_for_error, "output_path": None, "success": False, "error": f"Unexpected worker error: {loop_error}"})
+            # Continue processing next task if possible
+
+    # --- Worker Cleanup ---
+    print(f"[Worker {worker_pid}] Cleaning up...", file=sys.stderr)
+    if worker_model is not None:
+        del worker_model
+    if current_speaker_embedding is not None:
+        del current_speaker_embedding
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    print(f"[Worker {worker_pid}] Finished.", file=sys.stderr)
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Set start method for multiprocessing
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        print("Warning: Could not set multiprocessing start method to 'spawn'. Using default.", file=sys.stderr)
+
+    # --- Initialization ---
+    print(f"Main process started. Persistent workers will load model '{MODEL_NAME}'.", file=sys.stderr)
+    print(f"VRAM Requirement per worker: {REQUIRED_VRAM_PER_WORKER_GB:.1f} GB ({REQUIRED_VRAM_BYTES_PER_WORKER} bytes)", file=sys.stderr)
+
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    all_requests = [] # Flat list to hold all normalized requests
+    total_lines_read = 0
+    total_segments_parsed = 0
+    total_segments_succeeded = 0
+    results_map = {} # To store results by request_id
+
+    # --- Calculate Number of Workers ---
+    available_vram = get_available_vram()
+    print(f"Available VRAM check: {available_vram / (1024**3):.2f} GB", file=sys.stderr)
+
+    if available_vram < REQUIRED_VRAM_BYTES_PER_WORKER:
+         print(f"FATAL: Insufficient VRAM ({available_vram / (1024**3):.2f} GB) for even one worker ({REQUIRED_VRAM_PER_WORKER_GB:.1f} GB required). Exiting.", file=sys.stderr)
+         sys.exit(1)
+
+    num_workers = math.floor(available_vram / REQUIRED_VRAM_BYTES_PER_WORKER)
+    num_workers = max(1, num_workers) # Ensure at least one worker
+    print(f"Determined number of persistent workers: {num_workers}", file=sys.stderr)
+
+    # --- Read, Parse, Normalize All Input ---
+    print("Reading JSON lines from stdin (supports single 'text' or list 'texts')...", file=sys.stderr)
+    for line_num, line in enumerate(sys.stdin, 1):
+        total_lines_read += 1
         line = line.strip()
-        if not line:
-            continue # Skip empty lines
-
-        print(f"\n--- Processing line {lines_processed} ---", file=sys.stderr)
+        if not line: continue
         try:
             data = json.loads(line)
-            text = data.get("text")
-            output_path = data.get("output_path")
-            speaker_path = data.get("speaker_path") # Relative path expected
+            speaker_path = data.get("speaker_path")
+            if not speaker_path or not isinstance(speaker_path, str): raise ValueError("Missing or invalid 'speaker_path'")
 
-            if not all([text, output_path, speaker_path]):
-                print(f"Error: Missing required field in JSON input: {line}", file=sys.stderr)
-                continue
+            if "texts" in data and "output_paths" in data:
+                texts, output_paths = data["texts"], data["output_paths"]
+                if not isinstance(texts, list) or not isinstance(output_paths, list): raise ValueError("'texts' or 'output_paths' is not a list")
+                if len(texts) != len(output_paths): raise ValueError("Mismatched lengths for 'texts' and 'output_paths'")
+                if len(texts) == 0: print(f"Warning: Empty 'texts' list on line {line_num}. Skipping.", file=sys.stderr); continue
 
-            print(f"Request: Text='{text[:50]}...', Output='{output_path}', Speaker='{speaker_path}'", file=sys.stderr)
+                for i, (text, output_path) in enumerate(zip(texts, output_paths)):
+                    if not isinstance(text, str) or not isinstance(output_path, str): raise ValueError(f"Invalid item type at index {i}")
+                    all_requests.append({"text": text, "output_path": output_path, "speaker_path": speaker_path, "request_id": f"line{line_num}_seg{i}"})
+                    total_segments_parsed += 1
+                # print(f"Parsed {len(texts)} segments from line {line_num}.", file=sys.stderr) # Verbose
 
-            # --- Speaker Embedding Management ---
-            if speaker_path != current_speaker_path:
-                print(f"Speaker changed from '{current_speaker_path}' to '{speaker_path}'. Loading new embedding.", file=sys.stderr)
-                current_speaker_embedding = load_speaker_embedding(model, speaker_path, script_dir)
-                if current_speaker_embedding is None:
-                    print(f"Error: Failed to load speaker embedding for {speaker_path}. Skipping this line.", file=sys.stderr)
-                    current_speaker_path = None # Reset so it tries again next time
-                    continue
-                current_speaker_path = speaker_path
+            elif "text" in data and "output_path" in data:
+                text, output_path = data["text"], data["output_path"]
+                if not isinstance(text, str) or not isinstance(output_path, str): raise ValueError("Invalid type for 'text' or 'output_path'")
+                all_requests.append({"text": text, "output_path": output_path, "speaker_path": speaker_path, "request_id": f"line{line_num}"})
+                total_segments_parsed += 1
+                # print(f"Parsed 1 segment from line {line_num}.", file=sys.stderr) # Verbose
+
+            else: raise ValueError("Expected ('texts'/'output_paths') or ('text'/'output_path')")
+
+        except json.JSONDecodeError: print(f"Error: Invalid JSON on line {line_num}: {line}", file=sys.stderr)
+        except Exception as read_error: print(f"Error parsing line {line_num}: {read_error}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+
+    print(f"\nFinished reading stdin. Total lines read: {total_lines_read}. Total segments parsed: {total_segments_parsed}.", file=sys.stderr)
+
+    if not all_requests:
+        print("No valid requests found to process. Exiting.", file=sys.stderr)
+        sys.exit(0)
+
+    # --- Create Queues and Start Workers ---
+    task_queue = mp.Queue()
+    result_queue = mp.Queue()
+    workers = []
+
+    print(f"Starting {num_workers} worker processes...", file=sys.stderr)
+    for _ in range(num_workers):
+        process = mp.Process(target=persistent_worker, args=(task_queue, result_queue, script_dir))
+        workers.append(process)
+        process.start()
+
+    # --- Dispatch Tasks ---
+    print(f"Dispatching {len(all_requests)} tasks to workers...", file=sys.stderr)
+    for request_data in all_requests:
+        task_queue.put(request_data)
+
+    # --- Signal Workers to Stop ---
+    print("All tasks dispatched. Sending stop signals to workers...", file=sys.stderr)
+    for _ in range(num_workers):
+        task_queue.put(SENTINEL)
+
+    # --- Collect Results ---
+    print(f"Collecting {len(all_requests)} results...", file=sys.stderr)
+    for _ in range(len(all_requests)):
+        try:
+            # Use timeout to prevent hanging indefinitely if a worker dies unexpectedly
+            result = result_queue.get(timeout=300) # 5 min timeout per result
+            request_id = result.get("request_id", "unknown")
+            results_map[request_id] = result # Store result
+            if result and result.get("success"):
+                total_segments_succeeded += 1
+                # Print successful path to stdout for the calling process
+                print(result["output_path"], flush=True)
+            elif result:
+                 print(f"Error reported for request {request_id}: {result.get('error', 'Unknown worker error')}", file=sys.stderr)
             else:
-                print(f"Reusing speaker embedding for '{speaker_path}'.", file=sys.stderr)
-                if current_speaker_embedding is None:
-                     print(f"Error: Tried to reuse speaker embedding for {speaker_path}, but it failed to load previously. Skipping.", file=sys.stderr)
-                     continue # Skip if the embedding failed previously
+                 print(f"Warning: Received unexpected item from result queue: {result}", file=sys.stderr)
 
-            # --- Generate Audio for this line ---
-            success = generate_single_audio(model, text, output_path, current_speaker_embedding)
-            if success:
-                lines_succeeded += 1
+        except mp.queues.Empty:
+             print("Error: Result queue timed out. A worker might have crashed.", file=sys.stderr)
+             # How to handle? Mark remaining as failed? For now, just break collection.
+             break
+        except Exception as collect_err:
+             print(f"Error collecting result: {collect_err}", file=sys.stderr)
 
-        except json.JSONDecodeError:
-            print(f"Error: Invalid JSON received: {line}", file=sys.stderr)
-        except Exception as loop_error:
-            # Catch any other unexpected errors during the loop processing for a single line
-            print(f"Error processing line {lines_processed}: {loop_error}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
+
+    # --- Wait for Workers to Finish ---
+    print("Waiting for workers to terminate...", file=sys.stderr)
+    for process in workers:
+        process.join(timeout=30) # Give workers time to exit cleanly
+        if process.is_alive():
+             print(f"Warning: Worker process {process.pid} did not terminate gracefully. Forcing termination.", file=sys.stderr)
+             process.terminate() # Force kill if stuck
 
     print(f"\n--- Processing Complete ---", file=sys.stderr)
-    print(f"Total lines processed: {lines_processed}", file=sys.stderr)
-    print(f"Total lines succeeded: {lines_succeeded}", file=sys.stderr)
-    sys.exit(0) # Exit cleanly after processing all input
+    print(f"Total lines read from input: {total_lines_read}", file=sys.stderr)
+    print(f"Total segments parsed from input: {total_segments_parsed}", file=sys.stderr)
+    # Could iterate through results_map for more detailed error summary if needed
+    print(f"Total audio files successfully generated: {total_segments_succeeded}", file=sys.stderr)
+    sys.exit(0) # Exit cleanly
