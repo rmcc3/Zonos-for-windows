@@ -236,14 +236,16 @@ if __name__ == "__main__":
 
                 for i, (text, output_path) in enumerate(zip(texts, output_paths)):
                     if not isinstance(text, str) or not isinstance(output_path, str): raise ValueError(f"Invalid item type at index {i}")
-                    all_requests.append({"text": text, "output_path": output_path, "speaker_path": speaker_path, "request_id": f"line{line_num}_seg{i}"})
+                    filtered_text = text.replace("...", ".").replace("—", "").replace("–", "") # Replace ellipsis, remove em/en dashes
+                    all_requests.append({"text": filtered_text, "output_path": output_path, "speaker_path": speaker_path, "request_id": f"line{line_num}_seg{i}"})
                     total_segments_parsed += 1
                 # print(f"Parsed {len(texts)} segments from line {line_num}.", file=sys.stderr) # Verbose
 
             elif "text" in data and "output_path" in data:
                 text, output_path = data["text"], data["output_path"]
                 if not isinstance(text, str) or not isinstance(output_path, str): raise ValueError("Invalid type for 'text' or 'output_path'")
-                all_requests.append({"text": text, "output_path": output_path, "speaker_path": speaker_path, "request_id": f"line{line_num}"})
+                filtered_text = text.replace("...", ".").replace("—", "").replace("–", "") # Replace ellipsis, remove em/en dashes
+                all_requests.append({"text": filtered_text, "output_path": output_path, "speaker_path": speaker_path, "request_id": f"line{line_num}"})
                 total_segments_parsed += 1
                 # print(f"Parsed 1 segment from line {line_num}.", file=sys.stderr) # Verbose
 
