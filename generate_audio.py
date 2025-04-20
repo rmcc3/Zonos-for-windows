@@ -35,6 +35,7 @@ CUDA_OK = torch.cuda.is_available()
 CTL = re.compile(r"[\u0000-\u001F\u007F]")                     # control chars
 FMT = re.compile(r"[\u2000-\u206F\uFEFF]")                     # zero‑width varmints
 def clean(txt: str) -> str:
+    txt = txt.replace("'", "") # Remove apostrophes
     txt = txt.replace("...", ".").replace("—", "").replace("–", "")
     txt = CTL.sub("", txt)
     txt = FMT.sub("", txt)
